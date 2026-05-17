@@ -1,6 +1,4 @@
-# SMDD-Bench
-
-**"SMDD-Bench: Can LLMs Solve Real-World Small Molecule Drug Design Tasks?"**
+<h1 align="center">SMDD-Bench: Can LLMs Solve Real-World Small Molecule Drug Design Tasks?</h1>
 
 SMDD-Bench is a benchmark for evaluating LLM agents on small molecule drug design (SMDD) tasks. It is small-molecule drug design's analog to SWE-Bench: agents are given a task and a fixed toolkit (Python interpreter, structure prediction models, RDKit, etc.) and must produce a verifiable artifact. Tasks are designed to be computationally simple to verify (via ML models or RDKit) but scientifically challenging to solve.
 
