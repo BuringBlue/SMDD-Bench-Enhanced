@@ -1,0 +1,16 @@
+rdkit==2025.9.4
+numpy==1.26.4
+pandas==2.3.3
+scikit-learn==1.6.1
+scipy==1.13.1
+pyyaml==6.0.2
+boltz[cuda]==2.2.1
+cuequivariance-torch==0.8.1
+cuequivariance-ops-torch-cu12==0.8.1
+biotite==1.2.0
+biopython==1.84
+admet_ai==1.4.0
+python-dotenv==1.2.1
+litellm==1.83.3
+tenacity==9.1.4
+chembl_webresource_client==0.10.9
