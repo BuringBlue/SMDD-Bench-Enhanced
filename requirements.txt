@@ -14,3 +14,4 @@ python-dotenv==1.2.1
 litellm==1.83.3
 tenacity==9.1.4
 chembl_webresource_client==0.10.9
+boto3==1.43.11

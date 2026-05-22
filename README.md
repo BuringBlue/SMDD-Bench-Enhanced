@@ -143,7 +143,17 @@ See `type_docs/agent_harness.md` and `type_docs/evaluation_harness.md` for the p
 
 If you found the work interesting, you can cite us here:
 
-TBD
+```bibtex
+@misc{han2026smddbench,
+      title={SMDD-Bench: Can LLMs Solve Real-World Small Molecule Drug Design Tasks?}, 
+      author={Kevin Han and Renfei Zhang and Kathy Wei and Hamed Mahdavi and Niloofar Mireshghallah and Amir Farimani},
+      year={2026},
+      eprint={2605.21740},
+      archivePrefix={arXiv},
+      primaryClass={cs.AI},
+      url={https://arxiv.org/abs/2605.21740}, 
+}
+```
 
 ## Reporting an issue
 
