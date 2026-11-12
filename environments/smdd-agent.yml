@@ -1,0 +1,22 @@
+name: smdd-agent
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - rdkit=2025.09.5
+  - openbabel=3.1.1
+  - plip=3.0.0
+  - numpy=2.2.6
+  - pandas=2.3.3
+  - scikit-learn=1.7.2
+  - scipy=1.15.2
+  - pyyaml=6.0.3
+  - biopython=1.86
+  - lxml=6.0.2
+  - pip:
+      - biotite==1.2.0
+      - boto3==1.43.122
+      - litellm==1.83.3
+      - python-dotenv==1.0.1
+      - tenacity==9.2.1

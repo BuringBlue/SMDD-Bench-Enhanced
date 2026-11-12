@@ -1,0 +1,13 @@
+name: smdd-bench
+
+channels:
+  - conda-forge
+
+dependencies:
+  # Python 3.10 and these non-PyPI chemistry tools match the upstream
+  # agent/evaluator Dockerfiles. Python packages are installed from the
+  # repository's compatibility-pinned requirements-conda.txt separately.
+  - python=3.10
+  - pip
+  - openbabel=3.1.1
+  - plip=3.0.0

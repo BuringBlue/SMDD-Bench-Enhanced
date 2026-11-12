@@ -1,0 +1,8 @@
+# Container-side system requirement for the daemonless backend.
+# This is not a pip requirements file and must not be installed on the control machine.
+util-linux  # provides `unshare`; normally already present in the Miniconda base image
+
+# Runtime requirements checked fail-closed by the runner:
+# - linux/amd64
+# - Linux kernel with Landlock ABI >= 1 (kernel >= 5.13)
+# - user, network, PID, IPC and UTS namespaces permitted by the container platform
