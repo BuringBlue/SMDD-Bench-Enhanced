@@ -227,3 +227,30 @@ task_type3_similar
 
 *.pkl
 .claude
+
+# Large model weights and local model caches
+smdd-boltz-cache/
+*.ckpt
+*.safetensors
+*.pt
+*.pth
+*.bin
+*.tar
+
+# Local experiment outputs and runtime state
+model_evaluations/
+agent_outputs/
+runs/
+# Match both a directory and the current results symbolic link.
+results
+
+# Local scripts and packaged task data
+scripts/
+tasks_4_4_final.tar.gz
+
+# Local backend configuration may contain API keys and private endpoints
+LOCAL_BACKEND.md
+LOCAL_BACKEND.local.md
+
+# Machine-specific environment snapshots
+environment_snapshot/

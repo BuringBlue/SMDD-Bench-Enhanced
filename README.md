@@ -58,7 +58,7 @@ docker build -t smdd-evals evaluator/
 
 ### `agent_harness/run.py` — running the agent
 
-Launches one Docker container per task (one task per GPU at a time). Per-task results go to `results/{run-name}/{task_id}/`, and an `agent_summary.json` is written at the end. Before running, edit `agent_harness/config.py` to set the model, turn/token budgets, and tool limits; LiteLLM API keys go in a `.env` file at the repo root. `use_responses_api` refers to whether or not to use LiteLLM's OpenAI responses API. We recommend only setting this to true for the OpenAI models.
+Launches one Docker container per task (one task per GPU at a time). Per-task results go to `results/{run-name}/{task_id}/`, and an `agent_summary.json` is written at the end. Defaults live in `agent_harness/config.py`; the commonly changed LLM limits can be overridden on the command line. LiteLLM API keys go in a `.env` file at the repo root. `use_responses_api` refers to whether or not to use LiteLLM's OpenAI responses API. We recommend only setting this to true for the OpenAI models.
 
 ```bash
 # Run all tasks on all visible GPUs
@@ -74,7 +74,9 @@ python -m agent_harness.run --run-name my_run --tasks smdd_001_0001 smdd_002_000
 python -m agent_harness.run --run-name my_run --task-file my_tasks.txt
 
 # Override the model from AgentConfig
-python -m agent_harness.run --run-name my_run --model gpt-5.4
+python -m agent_harness.run --run-name my_run --model gpt-5.4 \
+    --max-output-tokens 4096 --max-consecutive-no-tool 3 \
+    --llm-timeout 300 --max-turns 100
 ```
 
 Flags:
@@ -87,16 +89,35 @@ Flags:
 | `--tasks` | Run specific task IDs (space-separated). |
 | `--task-file` | File with task IDs to run, one per line. |
 | `--model` | Override the model in `AgentConfig`. |
+| `--max-output-tokens` | Maximum generated tokens in one LLM response. |
+| `--max-consecutive-no-tool` | Stop a task after this many consecutive LLM turns without a tool call. |
+| `--llm-timeout` | Timeout in seconds for each LLM request. |
+| `--max-turns` | Maximum agent turns per task. |
 | `--gpus` | Comma-separated GPU indices, e.g. `0,1,2,3`. Default: all GPUs visible to `nvidia-smi`. |
-| `--workers` | Parallel worker processes. Default: number of GPUs. |
+| `--workers` | Concurrent task workers. Default: number of GPUs; may exceed it, in which case GPUs are assigned round-robin. |
+
+The example values limit each response to 4096 tokens, stop after 3
+consecutive turns without a tool call, give each LLM request 300 seconds,
+and allow at most 100 agent turns per task.
 
 Notes:
+- Runs resume automatically within the same `--results-dir` and `--run-name`. Tasks with a valid terminal `agent_result.json` are skipped; missing, invalid, or `error` results are retried.
+- The resolved settings are saved to `config.json` and reused when a run is resumed. Explicit CLI flags override the saved values.
+- GPU overcommit is supported, for example `--gpus 0 --workers 3`. This improves overlap while tasks wait for the LLM, but simultaneous Boltz calls share GPU memory and may cause OOM.
 - Containers run on an internal Docker network with the MSA server reachable only through an nginx TCP proxy sidecar (see `agent_harness/network.py`).
 - At least 1 GPU is required. If none are detected, the run aborts.
 
 ### `evaluator/evaluate.py` — scoring agent outputs
 
 Launches one `smdd-evals` Docker container per task to score the agent's submitted file against the metrics in `task.yaml`. Per-task `result.json` files go to `results/{run-name}/{task_id}/`, and `summary.json` is written at the end.
+
+Metrics run only when the task's `agent_result.json` has `status: submitted`.
+Every terminal non-submission status is recorded directly as a failed, zero-score
+`agent_not_submitted` result and remains included in the summary denominator.
+Selections are limited to task folders already created under `--agent-outputs`;
+in-progress folders without a terminal result are deferred. Until Agent marks
+the run complete, `summary.json` reports `status: in_progress` and
+`final_score: null` rather than a final benchmark score.
 
 ```bash
 # Evaluate every task in tasks/
@@ -125,14 +146,14 @@ Flags:
 | `--tasks-dir` | Directory with task definitions (default: `tasks`). |
 | `--docker-image` | Evaluator image name (default: `smdd-evals`). |
 | `--gpus` | Comma-separated GPU indices. Default: all visible GPUs; falls back to sequential CPU-only if none are detected (most type-3/4/5 metrics need a GPU). |
-| `--workers` | Parallel worker processes. Default: number of GPUs. |
+| `--workers` | Concurrent evaluator tasks. Default: number of GPUs; may exceed it, with workers assigned round-robin and sharing one serialized Boltz worker per GPU. |
 
 Exactly one task-selection flag is required (mutually exclusive):
 
 | Flag | Description |
 | --- | --- |
 | `--all` | Every task in `--tasks-dir`. |
-| `--all-in-folder` | Every task present in `--agent-outputs`. |
+| `--all-in-folder` | Every task present in `--agent-outputs`; non-submitted tasks are counted as failures without running metrics. |
 | `--tasks` | Specific task IDs (space-separated). |
 | `--task-file` | File with task IDs, one per line. |
 | `--type N` | All tasks of type number `N` (matches the `smdd_{N:03d}_*` prefix). |
