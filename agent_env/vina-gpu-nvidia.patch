@@ -1,0 +1,21 @@
+--- a/lib/main_procedure_cl.cpp
++++ b/lib/main_procedure_cl.cpp
+@@ -156,13 +156,16 @@
+ 
+ 	programs[1] = clCreateProgramWithSource(context, 1, (const char**)&final_files2_char, &final_size, &err); checkErr(err);
+ 	SetupBuildProgramWithSource(programs[1], NULL, devices, include_path, addtion);
+ 	SaveProgramToBinary(programs[1], "Kernel2_Opt.bin");
+-#endif
++#else
+ 	programs[0] = SetupBuildProgramWithBinary(context, devices, (opencl_binary_path + std::string("/Kernel1_Opt.bin")).c_str());
+ 
+ 	programs[1] = SetupBuildProgramWithBinary(context, devices, (opencl_binary_path + std::string("/Kernel2_Opt.bin")).c_str());
++#endif
+ 
+-	err = clUnloadPlatformCompiler(platforms[gpu_platform_id]); checkErr(err);
++	// NVIDIA may return CL_OUT_OF_HOST_MEMORY for this optional resource hint
++	// after both programs have built successfully. It is safe to continue.
++	(void)clUnloadPlatformCompiler(platforms[gpu_platform_id]);
+ 	//Set kernel arguments
+ 	cl_kernel kernels[2];
+ 	char kernel_name[][50] = { "kernel1","kernel2"};

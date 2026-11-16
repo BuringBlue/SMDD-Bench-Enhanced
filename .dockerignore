@@ -1,0 +1,12 @@
+.git/
+**/__pycache__/
+**/*.py[cod]
+
+# Large local datasets, caches, and run outputs are mounted at runtime.
+tasks/
+results/
+model_evaluations/
+agent_outputs/
+runs/
+smdd-boltz-cache/
+tasks_4_4_final.tar.gz
