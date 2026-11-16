@@ -31,6 +31,14 @@ class StartupPreflightTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "exceeds the per-task timeout"):
             validate_agent_config(config)
 
+    def test_invalid_docking_limits_are_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "vina_budget"):
+            validate_agent_config(replace(AgentConfig(), vina_budget=-1))
+        with self.assertRaisesRegex(RuntimeError, "diffdock_timeout"):
+            validate_agent_config(
+                replace(AgentConfig(), diffdock_timeout=43_201, task_timeout=43_200)
+            )
+
     def test_model_api_check_is_minimal_and_has_no_retries(self):
         completion = mock.Mock(return_value=object())
         fake_litellm = types.SimpleNamespace(completion=completion)

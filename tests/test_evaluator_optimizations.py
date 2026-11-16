@@ -31,15 +31,17 @@ from smdd_runtime.run_state import agent_run_is_complete, write_agent_run_state
 
 
 class FailFastTests(unittest.TestCase):
-    def test_prior_failure_skips_boltz_without_calling_it(self):
+    def test_gate_failure_skips_only_marked_downstream_steps(self):
         module_name = "_smdd_test_metrics"
         module = types.ModuleType(module_name)
         module.fail = lambda: False
+        calls = []
+        module.following_gate = lambda: calls.append("following_gate") or True
 
-        def unexpected_boltz():
-            raise AssertionError("Boltz must not run after a prior failure")
+        def unexpected_downstream():
+            raise AssertionError("Short-circuited step must not run")
 
-        module.assess_boltz = unexpected_boltz
+        module.unexpected_downstream = unexpected_downstream
         sys.modules[module_name] = module
         try:
             with tempfile.TemporaryDirectory() as root:
@@ -53,18 +55,36 @@ class FailFastTests(unittest.TestCase):
                     "output_config": {"file_path": "solution.smi"},
                     "evaluation": [
                         {
-                            "name": "Cheap gate",
+                            "name": "First gate",
                             "module": module_name,
                             "function": "fail",
                             "inputs": [],
                             "condition": {"eq": True},
+                            "short_circuit_on_failure": True,
+                        },
+                        {
+                            "name": "Second gate",
+                            "module": module_name,
+                            "function": "following_gate",
+                            "inputs": [],
+                            "condition": {"eq": True},
+                            "short_circuit_on_failure": True,
                         },
                         {
                             "name": "Boltz score",
                             "module": module_name,
-                            "function": "assess_boltz",
+                            "function": "unexpected_downstream",
                             "inputs": [],
                             "condition": {"eq": True},
+                            "skip_if_prior_short_circuit": True,
+                        },
+                        {
+                            "name": "Vina Docking",
+                            "module": module_name,
+                            "function": "unexpected_downstream",
+                            "inputs": [],
+                            "condition": {"eq": True},
+                            "skip_if_prior_short_circuit": True,
                         },
                     ],
                 }
@@ -73,8 +93,224 @@ class FailFastTests(unittest.TestCase):
                 )
                 result = EvaluationRunner(task_dir, output_dir, results_dir).run()
             self.assertEqual(result["status"], "failed")
-            self.assertEqual(result["steps"][1]["status"], "skipped")
-            self.assertIn("offline fail-fast", result["steps"][1]["reason"])
+            self.assertEqual(calls, ["following_gate"])
+            self.assertEqual(
+                [step["status"] for step in result["steps"]],
+                ["failed", "passed", "skipped", "skipped"],
+            )
+            self.assertIn("First gate", result["steps"][2]["reason"])
+        finally:
+            sys.modules.pop(module_name, None)
+
+    def test_downstream_failure_does_not_skip_later_steps(self):
+        module_name = "_smdd_test_metrics"
+        module = types.ModuleType(module_name)
+        calls = []
+        module.fail = lambda: calls.append("boltz") or False
+        module.pass_metric = lambda: calls.append("dock") or True
+        sys.modules[module_name] = module
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                task_dir = os.path.join(root, "task")
+                output_dir = os.path.join(root, "output")
+                results_dir = os.path.join(root, "results")
+                for path in (task_dir, output_dir, results_dir):
+                    os.makedirs(path)
+                task = {
+                    "id": "downstream_failure_test",
+                    "output_config": {"file_path": "solution.smi"},
+                    "evaluation": [
+                        {
+                            "name": "Boltz Binding & Affinity",
+                            "module": module_name,
+                            "function": "fail",
+                            "inputs": [],
+                            "condition": {"eq": True},
+                            "skip_if_prior_short_circuit": True,
+                        },
+                        {
+                            "name": "Vina Docking",
+                            "module": module_name,
+                            "function": "pass_metric",
+                            "inputs": [],
+                            "condition": {"eq": True},
+                            "skip_if_prior_short_circuit": True,
+                        },
+                    ],
+                }
+                Path(task_dir, "task.yaml").write_text(
+                    yaml.safe_dump(task), encoding="utf-8"
+                )
+                result = EvaluationRunner(task_dir, output_dir, results_dir).run()
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(calls, ["boltz", "dock"])
+            self.assertEqual(
+                [step["status"] for step in result["steps"]],
+                ["failed", "passed"],
+            )
+        finally:
+            sys.modules.pop(module_name, None)
+
+
+class StepResumeTests(unittest.TestCase):
+    def test_errored_task_reuses_completed_steps(self):
+        module_name = "_smdd_resume_metrics"
+        module = types.ModuleType(module_name)
+        calls = []
+
+        def unexpected():
+            raise AssertionError("Completed step must not run again")
+
+        module.unexpected = unexpected
+        module.retry = lambda: calls.append("retry") or True
+        sys.modules[module_name] = module
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                task_dir = Path(root, "task")
+                output_dir = Path(root, "output")
+                results_dir = Path(root, "results")
+                for path in (task_dir, output_dir, results_dir):
+                    path.mkdir()
+                task = {
+                    "id": "resume_steps_test",
+                    "output_config": {"file_path": "solution.smi"},
+                    "evaluation": [
+                        {
+                            "name": "Completed pass",
+                            "module": module_name,
+                            "function": "unexpected",
+                            "inputs": [],
+                            "condition": {"eq": True},
+                        },
+                        {
+                            "name": "Retry error",
+                            "module": module_name,
+                            "function": "retry",
+                            "inputs": [],
+                            "condition": {"eq": True},
+                        },
+                        {
+                            "name": "Completed failure",
+                            "module": module_name,
+                            "function": "unexpected",
+                            "inputs": [],
+                            "condition": {"eq": True},
+                        },
+                    ],
+                }
+                (task_dir / "task.yaml").write_text(
+                    yaml.safe_dump(task), encoding="utf-8"
+                )
+                (results_dir / "result.json").write_text(
+                    json.dumps({
+                        "task_id": "resume_steps_test",
+                        "status": "errored",
+                        "steps": [
+                            {
+                                "name": "Completed pass",
+                                "status": "passed",
+                                "result": True,
+                                "condition": {"eq": True},
+                                "duration_s": 1.0,
+                            },
+                            {
+                                "name": "Retry error",
+                                "status": "errored",
+                                "error": "transient",
+                                "duration_s": 1.0,
+                            },
+                            {
+                                "name": "Completed failure",
+                                "status": "failed",
+                                "result": False,
+                                "condition": {"eq": True},
+                                "duration_s": 1.0,
+                            },
+                        ],
+                    }),
+                    encoding="utf-8",
+                )
+                (results_dir / "eval.log").write_text(
+                    "previous evaluation log\n", encoding="utf-8"
+                )
+
+                result = EvaluationRunner(
+                    str(task_dir), str(output_dir), str(results_dir)
+                ).run()
+                log_contents = (results_dir / "eval.log").read_text(
+                    encoding="utf-8"
+                )
+
+            self.assertEqual(calls, ["retry"])
+            self.assertIn("previous evaluation log", log_contents)
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(
+                [step["status"] for step in result["steps"]],
+                ["passed", "passed", "failed"],
+            )
+            self.assertTrue(result["steps"][0]["reused"])
+            self.assertNotIn("reused", result["steps"][1])
+            self.assertTrue(result["steps"][2]["reused"])
+        finally:
+            sys.modules.pop(module_name, None)
+
+    def test_skipped_step_runs_after_upstream_error_recovers(self):
+        module_name = "_smdd_resume_metrics"
+        module = types.ModuleType(module_name)
+        calls = []
+        module.pass_gate = lambda: calls.append("gate") or True
+        module.pass_downstream = lambda: calls.append("downstream") or True
+        sys.modules[module_name] = module
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                task_dir = Path(root, "task")
+                output_dir = Path(root, "output")
+                results_dir = Path(root, "results")
+                for path in (task_dir, output_dir, results_dir):
+                    path.mkdir()
+                task = {
+                    "id": "resume_skipped_test",
+                    "output_config": {"file_path": "solution.smi"},
+                    "evaluation": [
+                        {
+                            "name": "Recovered gate",
+                            "module": module_name,
+                            "function": "pass_gate",
+                            "inputs": [],
+                            "condition": {"eq": True},
+                            "short_circuit_on_failure": True,
+                        },
+                        {
+                            "name": "Previously skipped",
+                            "module": module_name,
+                            "function": "pass_downstream",
+                            "inputs": [],
+                            "condition": {"eq": True},
+                            "skip_if_prior_short_circuit": True,
+                        },
+                    ],
+                }
+                (task_dir / "task.yaml").write_text(
+                    yaml.safe_dump(task), encoding="utf-8"
+                )
+                (results_dir / "result.json").write_text(
+                    json.dumps({
+                        "task_id": "resume_skipped_test",
+                        "status": "errored",
+                        "steps": [
+                            {"name": "Recovered gate", "status": "errored"},
+                            {"name": "Previously skipped", "status": "skipped"},
+                        ],
+                    }),
+                    encoding="utf-8",
+                )
+
+                result = EvaluationRunner(
+                    str(task_dir), str(output_dir), str(results_dir)
+                ).run()
+
+            self.assertEqual(calls, ["gate", "downstream"])
+            self.assertEqual(result["status"], "passed")
         finally:
             sys.modules.pop(module_name, None)
 
@@ -243,6 +479,52 @@ class SubmissionGateTests(unittest.TestCase):
             )
             self.assertEqual(summary["tasks_evaluated"], 1)
             self.assertEqual(list(summary["tasks"]), ["smdd_004_current_0"])
+
+    def test_summary_counts_failed_evaluation_steps(self):
+        with tempfile.TemporaryDirectory() as root:
+            run_name = "evaluation"
+            run_root = Path(root, run_name)
+            results = {
+                "smdd_004_first_0": {
+                    "task_id": "smdd_004_first_0",
+                    "status": "failed",
+                    "steps": [
+                        {"name": "Validity", "status": "passed"},
+                        {"name": "Novelty", "status": "failed"},
+                        {"name": "Vina Docking", "status": "failed"},
+                    ],
+                },
+                "smdd_004_second_0": {
+                    "task_id": "smdd_004_second_0",
+                    "status": "failed",
+                    "steps": [
+                        {"name": "Novelty", "status": "failed"},
+                        {"name": "Vina Docking", "status": "skipped"},
+                    ],
+                },
+                "smdd_004_unsubmitted_0": {
+                    "task_id": "smdd_004_unsubmitted_0",
+                    "status": "failed",
+                    "reason_code": "agent_not_submitted",
+                    "metrics_executed": False,
+                    "steps": [
+                        {"name": "Agent submission", "status": "failed"},
+                    ],
+                },
+            }
+            for task_id, result in results.items():
+                task_root = run_root / task_id
+                task_root.mkdir(parents=True)
+                (task_root / "result.json").write_text(
+                    json.dumps(result), encoding="utf-8"
+                )
+
+            summary = build_summary(run_name, root)
+
+            self.assertEqual(summary["step_failure_counts"], {
+                "Novelty": 2,
+                "Vina Docking": 1,
+            })
 
 
 class PersistentWorkerTests(unittest.TestCase):

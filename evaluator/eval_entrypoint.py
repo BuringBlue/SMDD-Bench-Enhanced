@@ -19,8 +19,8 @@ import traceback
 import time
 import numpy as np
 
-# Add the code directory to sys.path so metrics.* and evaluator.* are importable
-sys.path.insert(0, "/eval/code")
+# Docker uses /eval/code; the local backend points this at the shared checkout.
+sys.path.insert(0, os.environ.get("SMDD_CODE_DIR", "/eval/code"))
 
 
 class EvaluationRunner:
@@ -39,7 +39,26 @@ class EvaluationRunner:
 
         # Set up logging
         os.makedirs(results_dir, exist_ok=True)
+        self._resume_result = self._load_resume_result()
         self._setup_logging()
+        self._resume_steps = self._load_resume_steps()
+
+    def _load_resume_result(self):
+        """Load a previous errored result for this task, if present."""
+        result_path = os.path.join(self.results_dir, "result.json")
+        try:
+            with open(result_path, "r", encoding="utf-8") as handle:
+                result = json.load(handle)
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            return None
+
+        if (
+            not isinstance(result, dict)
+            or result.get("task_id") != self.task_id
+            or result.get("status") != "errored"
+        ):
+            return None
+        return result
 
     def _setup_logging(self):
         self.logger = logging.getLogger(f"eval.{self.task_id}")
@@ -48,7 +67,8 @@ class EvaluationRunner:
 
         # File handler
         log_path = os.path.join(self.results_dir, "eval.log")
-        fh = logging.FileHandler(log_path, mode='w')
+        log_mode = "a" if self._resume_result is not None else "w"
+        fh = logging.FileHandler(log_path, mode=log_mode)
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
         self.logger.addHandler(fh)
@@ -72,6 +92,8 @@ class EvaluationRunner:
             return os.path.join(self.task_dir, inp['value'])
         elif source == 'files':
             return [os.path.join(self.task_dir, v) for v in inp['value']]
+        elif source == 'results':
+            return os.path.join(self.results_dir, inp.get('value', ''))
         else:
             raise ValueError(f"Unsupported input source type: {source}")
 
@@ -155,6 +177,27 @@ class EvaluationRunner:
         with open(err_path, 'w') as f:
             f.write(tb_str)
 
+    def _load_resume_steps(self):
+        """Load completed steps from a previous errored evaluation."""
+        if self._resume_result is None:
+            return {}
+
+        completed = {}
+        for step in self._resume_result.get("steps", []):
+            if not isinstance(step, dict) or step.get("status") not in {
+                "passed", "failed"
+            }:
+                continue
+            name = step.get("name")
+            if isinstance(name, str):
+                completed[name] = step
+        if completed:
+            self.logger.info(
+                "Resuming errored evaluation with %d completed steps",
+                len(completed),
+            )
+        return completed
+
     def run(self):
         """Run all evaluation steps. Returns a result dict."""
         self.logger.info(f"Evaluating task: {self.task_id}")
@@ -163,11 +206,44 @@ class EvaluationRunner:
         self.logger.info(f"Results dir: {self.results_dir}")
 
         steps_results = []
+        short_circuit_reason = None
 
         for idx, step in enumerate(self.task['evaluation']):
             step_name = step['name']
             self.logger.info(f"--- Step {idx}: {step_name} ---")
             t0 = time.time()
+
+            if short_circuit_reason and step.get("skip_if_prior_short_circuit"):
+                self.logger.info(
+                    f"Step '{step_name}': skipped ({short_circuit_reason})"
+                )
+                steps_results.append({
+                    "name": step_name,
+                    "status": "skipped",
+                    "reason": short_circuit_reason,
+                    "duration_s": 0.0,
+                })
+                continue
+
+            previous = self._resume_steps.get(step_name)
+            if previous and previous.get("condition") == step.get("condition"):
+                step_result = dict(previous)
+                step_result["reused"] = True
+                steps_results.append(step_result)
+                self.logger.info(
+                    "Step '%s': reused previous %s result",
+                    step_name,
+                    step_result["status"],
+                )
+                if (
+                    step_result["status"] == "failed"
+                    and step.get("short_circuit_on_failure")
+                    and short_circuit_reason is None
+                ):
+                    short_circuit_reason = (
+                        f"upstream gate '{step_name}' failed"
+                    )
+                continue
 
             try:
                 raw_result = self._execute_step(step)
@@ -190,13 +266,24 @@ class EvaluationRunner:
                 status = "passed" if passed else "failed"
                 self.logger.info(f"Step '{step_name}': {status} (result={check_val}, condition={step['condition']}, duration={duration:.2f}s)")
 
-                steps_results.append({
+                step_result = {
                     "name": step_name,
                     "status": status,
                     "result": self._make_json_safe(check_val),
                     "condition": step['condition'],
                     "duration_s": round(duration, 2),
-                })
+                }
+                if step.get('include_details'):
+                    step_result["details"] = self._make_json_safe(raw_result)
+                steps_results.append(step_result)
+                if (
+                    not passed
+                    and step.get("short_circuit_on_failure")
+                    and short_circuit_reason is None
+                ):
+                    short_circuit_reason = (
+                        f"upstream gate '{step_name}' failed"
+                    )
 
             except Exception as e:
                 duration = time.time() - t0
@@ -213,6 +300,13 @@ class EvaluationRunner:
                     "error_traceback": tb_str,
                     "duration_s": round(duration, 2),
                 })
+                if (
+                    step.get("short_circuit_on_failure")
+                    and short_circuit_reason is None
+                ):
+                    short_circuit_reason = (
+                        f"upstream gate '{step_name}' errored"
+                    )
 
         # Determine overall status: errored > failed > passed
         statuses = [s['status'] for s in steps_results]
@@ -233,9 +327,9 @@ class EvaluationRunner:
         return result
 
 
-TASK_DIR = "/eval/task"
-OUTPUT_DIR = "/eval/output"
-RESULTS_DIR = "/eval/results"
+TASK_DIR = os.environ.get("SMDD_TASK_DIR", "/eval/task")
+OUTPUT_DIR = os.environ.get("SMDD_OUTPUT_DIR", "/eval/output")
+RESULTS_DIR = os.environ.get("SMDD_RESULTS_DIR", "/eval/results")
 
 
 def main():

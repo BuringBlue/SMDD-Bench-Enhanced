@@ -20,6 +20,8 @@ class AgentLogger:
         self.total_cache_creation_tokens = 0
         self.boltz_calls = 0
         self.admet_calls = 0
+        self.vina_calls = 0
+        self.diffdock_calls = 0
         self.refusals = 0
         self._start_time = time.time()
 
@@ -190,6 +192,8 @@ class AgentLogger:
             "total_cache_creation_tokens": self.total_cache_creation_tokens,
             "boltz_calls": self.boltz_calls,
             "admet_calls": self.admet_calls,
+            "vina_calls": self.vina_calls,
+            "diffdock_calls": self.diffdock_calls,
             "wall_time_s": round(wall_time, 2),
         }
         self._write_event(summary)
@@ -204,6 +208,8 @@ class AgentLogger:
             f.write(f"- Cache creation tokens: {self.total_cache_creation_tokens}\n")
             f.write(f"- Boltz calls: {self.boltz_calls}\n")
             f.write(f"- ADMET calls: {self.admet_calls}\n")
+            f.write(f"- Vina calls: {self.vina_calls}\n")
+            f.write(f"- DiffDock calls: {self.diffdock_calls}\n")
             f.write(f"- Refusals: {self.refusals}\n")
             f.write(f"- Wall time: {wall_time:.1f}s\n")
 

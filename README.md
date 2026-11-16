@@ -53,8 +53,27 @@ The agent and evaluation harnesses run on a single host with one or more NVIDIA 
 
 ```bash
 docker build -t smdd-agent agent_env/
-docker build -t smdd-evals evaluator/
+docker build -t smdd-evals -f evaluator/Dockerfile .
 ```
+
+The agent image includes two additional isolated docking environments:
+
+- `/opt/vina`: Vina-GPU 2.1 (NVIDIA OpenCL backend), AutoDock Vina 1.2.7,
+  and Meeko 0.8.0. The `dock_vina` tool accepts a workspace receptor
+  PDB/PDBQT, ligand SMILES, an explicit search box, and a GPU search depth.
+- `/opt/diffdock`: DiffDock-L 1.1.3 with Python 3.9 and the H800-compatible
+  Torch 2.1.2/CUDA 12.1 inference stack. The `dock_diffdock` tool accepts a
+  workspace receptor PDB and ligand SMILES and returns ranked SDF poses with
+  confidence scores.
+
+Both environments use separate Conda prefixes, so their
+RDKit/Torch dependencies do not modify the default agent environment or the
+existing `/opt/oracle` Boltz/ADMET environment. The evaluator image inherits
+these same isolated prefixes from `smdd-agent`. Vina-GPU is compiled into the
+`/opt/vina` prefix because upstream does not publish a Conda package. DiffDock
+source, model weights, ESM-2 weights, and lookup tables are pinned into the image because agent
+containers do not have general network access at runtime. Consequently, the
+agent image is substantially larger and slower to build than before.
 
 ### `agent_harness/run.py` — running the agent
 

@@ -1,6 +1,7 @@
 import os
 import shutil
 import subprocess
+import tempfile
 import yaml
 import json
 import urllib.request
@@ -10,7 +11,9 @@ from rdkit.Chem import AllChem
 class BoltzManager:
     def __init__(self, work_dir="."):
         self.work_dir = os.path.abspath(work_dir)
-        self.boltz_cmd = "boltz"
+        self.boltz_cmd = os.environ.get(
+            "SMDD_BOLTZ_EXECUTABLE", "/opt/oracle/bin/boltz"
+        )
 
     @staticmethod
     def _parse_chain_ids(header):
@@ -180,18 +183,79 @@ class BoltzManager:
         output_dir = os.path.join(self.work_dir, output_dir_name)
         if os.path.exists(output_dir):
             shutil.rmtree(output_dir)
-        cmd = [self.boltz_cmd, "predict", yaml_path, "--out_dir", output_dir, "--use_msa_server", "--use_potentials", "--diffusion_samples", str(diffusion_samples), "--seed", "42", "--diffusion_samples_affinity", str(diffusion_samples), "--max_parallel_samples", "2"]
+        job_name = os.path.splitext(os.path.basename(yaml_path))[0]
+        msa_socket = os.environ.get("SMDD_MSA_SOCKET")
+        has_msa_broker = msa_socket or os.environ.get("SMDD_MSA_FD")
+        if has_msa_broker:
+            from smdd_runtime.msa import attach_msas
+            yaml_path = attach_msas(yaml_path, os.path.join(self.work_dir, ".msa"), msa_socket or "")
+        worker_socket = os.environ.get("SMDD_BOLTZ_SOCKET")
+        if worker_socket and not has_msa_broker:
+            raise RuntimeError("Persistent evaluator Boltz requires the trusted MSA broker")
+        max_parallel = os.environ.get("SMDD_BOLTZ_MAX_PARALLEL_SAMPLES", "2")
+        num_workers = os.environ.get("SMDD_BOLTZ_NUM_WORKERS", "2")
+        cmd = [self.boltz_cmd, "predict", yaml_path, "--out_dir", output_dir, "--use_potentials", "--diffusion_samples", str(diffusion_samples), "--seed", "42", "--diffusion_samples_affinity", str(diffusion_samples), "--max_parallel_samples", max_parallel, "--num_workers", num_workers]
+        if not has_msa_broker:
+            cmd.append("--use_msa_server")
 
-        result = subprocess.run(cmd)
-        if result.returncode != 0:
+        debug_dir = os.environ.get("SMDD_BOLTZ_DEBUG_DIR")
+        if debug_dir:
+            os.makedirs(debug_dir, exist_ok=True)
+            stdout_path = os.path.join(debug_dir, f"{job_name}.stdout.log")
+            stderr_path = os.path.join(debug_dir, f"{job_name}.stderr.log")
+            stdout_stream = open(stdout_path, "wb+")
+            stderr_stream = open(stderr_path, "wb+")
+        else:
+            stdout_path = stderr_path = None
+            stdout_stream = tempfile.TemporaryFile(mode="w+b")
+            stderr_stream = tempfile.TemporaryFile(mode="w+b")
+
+        try:
+            if worker_socket:
+                from smdd_runtime.boltz_worker import request_boltz
+
+                boltz_executable = shutil.which(self.boltz_cmd)
+                if not boltz_executable:
+                    raise RuntimeError("Boltz executable is unavailable to the evaluator")
+                worker_cmd = [boltz_executable, *cmd[1:]]
+                timeout = int(os.environ.get("SMDD_BOLTZ_TIMEOUT", "3600"))
+                output, returncode = request_boltz(
+                    worker_socket,
+                    worker_cmd,
+                    timeout=timeout,
+                )
+                stdout_stream.write(output.encode("utf-8", errors="replace"))
+            else:
+                result = subprocess.run(cmd, stdout=stdout_stream, stderr=stderr_stream)
+                returncode = result.returncode
+            stdout_tail = self._stream_tail(stdout_stream)
+            stderr_tail = self._stream_tail(stderr_stream)
+        finally:
+            stdout_stream.close()
+            stderr_stream.close()
+
+        if returncode != 0:
             # Check if any prediction files were produced despite the error
             import glob as _glob
             prediction_files = _glob.glob(os.path.join(output_dir, "**", "*.cif"), recursive=True)
             if not prediction_files:
-                print(f"Boltz prediction failed (exit code {result.returncode}) and produced no output files. Possible OOM or other fatal error.")
-                return None
-            print(f"Warning: Boltz exited with code {result.returncode} but produced {len(prediction_files)} prediction files. Continuing.")
+                raw_error = stderr_tail.strip() or stdout_tail.strip() or "Boltz produced no diagnostic output."
+                log_hint = ""
+                if debug_dir:
+                    log_hint = f" Full logs: {stdout_path}, {stderr_path}."
+                raise RuntimeError(
+                    f"Boltz prediction failed with exit code {returncode} and produced no CIF files."
+                    f"{log_hint}\nBoltz error output:\n{raw_error}"
+                )
+            print(f"Warning: Boltz exited with code {returncode} but produced {len(prediction_files)} prediction files. Continuing.")
         return output_dir
+
+    @staticmethod
+    def _stream_tail(stream, limit=8000):
+        stream.flush()
+        stream.seek(0, os.SEEK_END)
+        stream.seek(max(0, stream.tell() - limit))
+        return stream.read().decode("utf-8", errors="replace")
 
     def extract_predict_results(self, results_dir, job_name):
         results_file = os.path.join(results_dir, "predictions", job_name, f"confidence_{job_name}_model_0.json")

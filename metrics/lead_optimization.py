@@ -1,8 +1,10 @@
+import json
 import os
+import subprocess
 import sys
 import numpy as np
 from rdkit import Chem
-from rdkit.Chem import Descriptors, Crippen, Lipinski, AllChem, DataStructs, RDConfig
+from rdkit.Chem import Descriptors, Crippen, Lipinski, AllChem, DataStructs, QED, RDConfig
 from rdkit.Chem.FilterCatalog import FilterCatalog, FilterCatalogParams
 
 from metrics.boltz_manager import BoltzManager
@@ -11,22 +13,7 @@ from metrics.boltz_manager import BoltzManager
 sys.path.append(os.path.join(RDConfig.RDContribDir, 'SA_Score'))
 import sascorer
 
-# Lazy singleton for ADMET-AI model
-_admet_model = None
-
-def _get_admet_model():
-    global _admet_model
-    if _admet_model is None:
-        import functools, torch, contextlib, io
-        _original_load = torch.load
-        torch.load = functools.partial(_original_load, weights_only=False)
-        try:
-            from admet_ai import ADMETModel
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                _admet_model = ADMETModel()
-        finally:
-            torch.load = _original_load
-    return _admet_model
+_admet_cache = {}
 
 # ADMET-AI dataset name -> our canonical property name
 _ADMET_DATASET_TO_PROPERTY = {
@@ -59,7 +46,13 @@ def read_smiles_file(file_path):
     return content
 
 
-def assess_hard_constraints(agent_file_path, reference_file_path, similarity_threshold=0.7, skip_tanimoto=False):
+def assess_hard_constraints(
+    agent_file_path,
+    reference_file_path,
+    similarity_threshold=0.7,
+    skip_tanimoto=False,
+    qed_threshold=None,
+):
     """Check all RDKit-computable hard constraints (excludes Boltz binding probability).
 
     Args:
@@ -69,6 +62,7 @@ def assess_hard_constraints(agent_file_path, reference_file_path, similarity_thr
         similarity_threshold: minimum Tanimoto similarity to reference (default 0.7)
         skip_tanimoto: if True, skip the Tanimoto similarity check entirely (e.g. for task 5
                        where there is no single reference molecule)
+        qed_threshold: optional minimum quantitative estimate of drug-likeness
 
     Returns:
         dict with "all_passed" bool and per-constraint details
@@ -137,6 +131,14 @@ def assess_hard_constraints(agent_file_path, reference_file_path, similarity_thr
     sa = sascorer.calculateScore(mol)
     results["sa_score"] = {"passed": sa < 4.5, "value": round(sa, 2), "threshold": "< 4.5"}
 
+    if qed_threshold is not None:
+        qed = QED.qed(mol)
+        results["qed"] = {
+            "passed": qed >= qed_threshold,
+            "value": round(qed, 4),
+            "threshold": f">= {qed_threshold}",
+        }
+
     # --- PAINS filter ---
     pains_match = _PAINS_CATALOG.HasMatch(mol)
     results["pains"] = {"passed": not pains_match, "value": "match" if pains_match else "clean"}
@@ -176,16 +178,33 @@ def assess_admet_properties(agent_file_path):
     Returns:
         dict of canonical property names to predicted values
     """
-    import contextlib, io
     smiles = read_smiles_file(agent_file_path)
-    model = _get_admet_model()
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        preds = model.predict(smiles=smiles)
+    if smiles in _admet_cache:
+        return dict(_admet_cache[smiles])
 
-    result = {}
-    for dataset_name, prop_name in _ADMET_DATASET_TO_PROPERTY.items():
-        result[prop_name] = float(preds[dataset_name])
-    return result
+    oracle_python = os.environ.get("SMDD_ORACLE_PYTHON", "/opt/oracle/bin/python")
+    runner = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)),
+        "smdd_runtime",
+        "admet_predict.py",
+    )
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    process = subprocess.run(
+        [oracle_python, runner, "--smiles", smiles],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env=env,
+    )
+    if process.returncode != 0:
+        raise RuntimeError(f"ADMET Oracle subprocess failed: {process.stderr[-2000:]}")
+    try:
+        result = json.loads(process.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Invalid ADMET Oracle output: {process.stdout[-2000:]}") from exc
+    _admet_cache[smiles] = result
+    return dict(result)
 
 
 def assess_optimization_objectives(agent_file_path, baseline_values, objectives):

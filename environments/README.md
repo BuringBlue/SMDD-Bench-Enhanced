@@ -11,9 +11,9 @@ Create the environments with:
 scripts/create_smdd_conda_envs.sh
 ```
 
-The creation script clones the container's pre-provisioned CPU chemistry stack
-from Conda base, then removes the LLM client packages from `smdd-eval`. The YAML
-files in this directory record the intended dependency sets. Neither environment
+The creation script resolves each YAML independently instead of cloning Conda
+base. This prevents historical exact specs from pinning an incompatible ABI
+stack and keeps LLM client packages out of `smdd-eval`. Neither environment
 copies packages from `/opt/oracle`.
 
 Launch with:

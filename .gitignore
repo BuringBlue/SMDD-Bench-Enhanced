@@ -244,8 +244,12 @@ runs/
 # Match both a directory and the current results symbolic link.
 results
 
-# Local scripts and packaged task data
-scripts/
+# Local scripts and packaged task data. Keep machine-specific launchers private,
+# but version the secret-free local-backend entrypoints.
+scripts/*
+!scripts/create_smdd_conda_envs.sh
+!scripts/run_agent_local.sh
+!scripts/run_eval_local.sh
 tasks_4_4_final.tar.gz
 
 # Local backend configuration may contain API keys and private endpoints

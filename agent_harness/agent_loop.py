@@ -9,15 +9,55 @@ from typing import Optional
 from agent_harness.config import AgentConfig
 from agent_harness.logger import AgentLogger
 from agent_harness.prompts import TOOL_SCHEMAS, build_system_prompt
+
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+os.environ.setdefault("LITELLM_DISABLE_TELEMETRY", "True")
 import litellm
 from agent_harness.tools import ToolExecutor
 
 litellm.drop_params = True
+
+
+@dataclass
+class _SubmitRetryGuard:
+    path: Optional[str] = None
+    failures: int = 0
+
+    @staticmethod
+    def key(arguments) -> str:
+        path = str(arguments.get("file_path", "")).strip()
+        if path.startswith("/workspace/"):
+            path = path[len("/workspace/"):]
+        return os.path.normpath(path) if path else ""
+
+    def reset(self) -> None:
+        self.path = None
+        self.failures = 0
+
+    def blocked(self, path: str) -> bool:
+        return path == self.path and self.failures >= 2
+
+    def record_failure(self, path: str) -> int:
+        if path == self.path:
+            self.failures += 1
+        else:
+            self.path = path
+            self.failures = 1
+        return self.failures
+
+
+SUBMIT_CORRECTION = (
+    "Do not call submit() for this path again until the file exists. "
+    "Use the python tool to write the requested output file in the workspace, "
+    "then call submit()."
+)
+
 # ---------------------------------------------------------------------------
 # Responses API caller (default)
 # ---------------------------------------------------------------------------
 
-def call_llm(model, input_items, tools, instructions, temperature=0.0):
+def call_llm(model, input_items, tools, instructions, temperature=0.0,
+             max_output_tokens=None, timeout=None):
     """Call an LLM via LiteLLM Responses API. Returns the response object.
 
     Args:
@@ -27,7 +67,7 @@ def call_llm(model, input_items, tools, instructions, temperature=0.0):
         instructions: System prompt string
         temperature: Sampling temperature
     """
-    response = litellm.responses(
+    kwargs = dict(
         model=model,
         input=input_items,
         tools=tools,
@@ -38,9 +78,13 @@ def call_llm(model, input_items, tools, instructions, temperature=0.0):
         },
         text={"verbosity": "high"},
         # thinking={"type":"enabled"},
-        num_retries=25
+        num_retries=25,
     )
-    return response
+    if max_output_tokens is not None:
+        kwargs["max_output_tokens"] = max_output_tokens
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+    return litellm.responses(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +256,8 @@ class _FakeResponse:
         return items
 
 
-def call_llm_completions(model, messages, tools, temperature=0.0):
+def call_llm_completions(model, messages, tools, temperature=0.0,
+                         max_output_tokens=None, timeout=None):
     """Call an LLM via LiteLLM Completions API with enxplicit caching."""
     kwargs = dict(
         model=model,
@@ -222,6 +267,10 @@ def call_llm_completions(model, messages, tools, temperature=0.0):
         num_retries=25,
         reasoning_effort="medium",
     )
+    if max_output_tokens is not None:
+        kwargs["max_tokens"] = max_output_tokens
+    if timeout is not None:
+        kwargs["timeout"] = timeout
     # LiteLLM's together_ai/ provider drops tools= silently for MiniMax models.
     # Route via the openai-compatible endpoint against Together's base URL.
     if "MiniMax" in model:
@@ -233,7 +282,7 @@ def call_llm_completions(model, messages, tools, temperature=0.0):
 
 @dataclass
 class AgentResult:
-    status: str  # "submitted", "max_turns_exceeded", "token_budget_exceeded", "error"
+    status: str  # submitted, limit exceeded, or error
     turns_used: int = 0
     total_input_tokens: int = 0
     total_output_tokens: int = 0
@@ -241,11 +290,13 @@ class AgentResult:
     total_cache_creation_tokens: int = 0
     boltz_calls: int = 0
     admet_calls: int = 0
+    vina_calls: int = 0
+    diffdock_calls: int = 0
     submitted_file: Optional[str] = None
     error: Optional[str] = None
 
 
-def run_agent(task_yaml, task_dir, config: AgentConfig, container_id: str, output_dir: str) -> AgentResult:
+def run_agent(task_yaml, task_dir, config: AgentConfig, container_id: str, output_dir: str, executor=None) -> AgentResult:
     """Run the agent loop for a single task.
 
     Args:
@@ -259,7 +310,7 @@ def run_agent(task_yaml, task_dir, config: AgentConfig, container_id: str, outpu
         AgentResult with status and metadata
     """
     logger = AgentLogger(output_dir, task_yaml.get("id", "unknown"))
-    executor = ToolExecutor(container_id, config)
+    executor = executor or ToolExecutor(container_id, config)
 
     system_prompt = build_system_prompt(config)
     task_description = task_yaml.get("description", "No description provided.")
@@ -267,7 +318,7 @@ def run_agent(task_yaml, task_dir, config: AgentConfig, container_id: str, outpu
     logger.log_system_prompt(system_prompt)
 
     # Build initial input (system prompt passed via instructions parameter)
-    initial_message = f"## Task\n\n{task_description}\n\nYour workspace at /workspace contains the task files. Start by examining them."
+    initial_message = f"## Task\n\n{task_description}\n\nYour current working directory contains the task files. Start by examining them."
     input_items = [
         {"role": "user", "content": initial_message},
     ]
@@ -283,6 +334,8 @@ def run_agent(task_yaml, task_dir, config: AgentConfig, container_id: str, outpu
 
     turn = 0
     refusal_count = 0
+    consecutive_no_tool = 0
+    submit_guard = _SubmitRetryGuard()
     while turn < config.max_turns:
         turn += 1
 
@@ -298,6 +351,8 @@ def run_agent(task_yaml, task_dir, config: AgentConfig, container_id: str, outpu
                 total_cache_creation_tokens=logger.total_cache_creation_tokens,
                 boltz_calls=executor.boltz_calls,
                 admet_calls=executor.admet_calls,
+                vina_calls=executor.vina_calls,
+                diffdock_calls=executor.diffdock_calls,
             )
 
         # Call LLM
@@ -309,6 +364,8 @@ def run_agent(task_yaml, task_dir, config: AgentConfig, container_id: str, outpu
                     tools=TOOL_SCHEMAS,
                     instructions=system_prompt,
                     temperature=config.temperature,
+                    max_output_tokens=config.max_output_tokens,
+                    timeout=config.llm_timeout,
                 )
             else:
                 messages = _responses_input_to_messages(input_items, system_prompt)
@@ -317,6 +374,8 @@ def run_agent(task_yaml, task_dir, config: AgentConfig, container_id: str, outpu
                     messages=messages,
                     tools=_completions_tools(TOOL_SCHEMAS),
                     temperature=config.temperature,
+                    max_output_tokens=config.max_output_tokens,
+                    timeout=config.llm_timeout,
                 )
         except Exception as e:
             logger.log_summary("error", turn - 1)
@@ -329,6 +388,8 @@ def run_agent(task_yaml, task_dir, config: AgentConfig, container_id: str, outpu
                 total_cache_creation_tokens=logger.total_cache_creation_tokens,
                 boltz_calls=executor.boltz_calls,
                 admet_calls=executor.admet_calls,
+                vina_calls=executor.vina_calls,
+                diffdock_calls=executor.diffdock_calls,
                 error=str(e),
             )
 
@@ -340,7 +401,24 @@ def run_agent(task_yaml, task_dir, config: AgentConfig, container_id: str, outpu
 
         # No tool calls: agent is talking without acting
         if not function_calls:
+            consecutive_no_tool += 1
             input_items.extend([item.model_dump() for item in output_items])
+
+            if (config.max_consecutive_no_tool is not None and
+                    consecutive_no_tool >= config.max_consecutive_no_tool):
+                logger.log_summary("no_tool_limit_exceeded", turn)
+                return AgentResult(
+                    status="no_tool_limit_exceeded",
+                    turns_used=turn,
+                    total_input_tokens=logger.total_input_tokens,
+                    total_output_tokens=logger.total_output_tokens,
+                    total_cache_read_tokens=logger.total_cache_read_tokens,
+                    total_cache_creation_tokens=logger.total_cache_creation_tokens,
+                    boltz_calls=executor.boltz_calls,
+                    admet_calls=executor.admet_calls,
+                    vina_calls=executor.vina_calls,
+                    diffdock_calls=executor.diffdock_calls,
+                )
 
             # Detect refusal — don't count this turn (up to max_refusals)
             text_parts = [item.text for item in output_items if hasattr(item, "text") and item.text]
@@ -359,6 +437,7 @@ def run_agent(task_yaml, task_dir, config: AgentConfig, container_id: str, outpu
             continue
 
         # Process tool calls — append all output items first
+        consecutive_no_tool = 0
         dumped_items = [item.model_dump() for item in output_items]
         # Sanitize malformed tool call arguments so they don't poison the next API call
         for d in dumped_items:
@@ -376,8 +455,23 @@ def run_agent(task_yaml, task_dir, config: AgentConfig, container_id: str, outpu
             except json.JSONDecodeError:
                 tool_args = {}
 
+            submit_path = submit_guard.key(tool_args) if tool_name == "submit" else ""
+            correction = None
             t0 = time.time()
-            result_str, extra = executor.dispatch(tool_name, tool_args)
+            if tool_name == "submit" and submit_guard.blocked(submit_path):
+                result_str = f"ERROR: Repeated submission blocked. {SUBMIT_CORRECTION}"
+                extra = {"repeated_submit_blocked": True}
+            else:
+                if tool_name != "submit":
+                    submit_guard.reset()
+                result_str, extra = executor.dispatch(tool_name, tool_args)
+                if tool_name == "submit":
+                    if result_str.lstrip().startswith("ERROR"):
+                        if submit_guard.record_failure(submit_path) == 2:
+                            correction = SUBMIT_CORRECTION
+                            result_str = f"{result_str}\n\n{correction}"
+                    else:
+                        submit_guard.reset()
             duration = time.time() - t0
 
             logger.log_tool_call(turn, tool_name, tool_args, result_str, duration, extra)
@@ -385,6 +479,8 @@ def run_agent(task_yaml, task_dir, config: AgentConfig, container_id: str, outpu
             # Update logger counters from executor
             logger.boltz_calls = executor.boltz_calls
             logger.admet_calls = executor.admet_calls
+            logger.vina_calls = executor.vina_calls
+            logger.diffdock_calls = executor.diffdock_calls
 
             # Append function call output to input
             input_items.append({
@@ -392,10 +488,13 @@ def run_agent(task_yaml, task_dir, config: AgentConfig, container_id: str, outpu
                 "call_id": fc.call_id,
                 "output": result_str,
             })
+            if correction:
+                input_items.append({"role": "user", "content": correction})
+                logger.log_user_message(turn, correction)
 
             # Check for submission
-            if tool_name == "submit" and "ERROR" not in result_str:
-                submitted_file = tool_args.get("file_path", "")
+            if tool_name == "submit" and not result_str.lstrip().startswith("ERROR"):
+                submitted_file = extra.get("submitted_file", tool_args.get("file_path", ""))
                 logger.log_submit(turn, submitted_file)
                 logger.log_summary("submitted", turn)
                 return AgentResult(
@@ -407,6 +506,8 @@ def run_agent(task_yaml, task_dir, config: AgentConfig, container_id: str, outpu
                     total_cache_creation_tokens=logger.total_cache_creation_tokens,
                     boltz_calls=executor.boltz_calls,
                     admet_calls=executor.admet_calls,
+                    vina_calls=executor.vina_calls,
+                    diffdock_calls=executor.diffdock_calls,
                     submitted_file=submitted_file,
                 )
 
@@ -431,4 +532,6 @@ def run_agent(task_yaml, task_dir, config: AgentConfig, container_id: str, outpu
         total_cache_creation_tokens=logger.total_cache_creation_tokens,
         boltz_calls=executor.boltz_calls,
         admet_calls=executor.admet_calls,
+        vina_calls=executor.vina_calls,
+        diffdock_calls=executor.diffdock_calls,
     )

@@ -2,10 +2,10 @@ name: smdd-agent
 channels:
   - conda-forge
 dependencies:
-  - python=3.10
+  - python=3.11
   - pip
-  - rdkit=2025.09.5
-  - openbabel=3.1.1
+  - rdkit=2026.03.4
+  - openbabel=3.2.1
   - plip=3.0.0
   - numpy=2.2.6
   - pandas=2.3.3

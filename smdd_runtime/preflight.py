@@ -31,9 +31,14 @@ def validate_agent_config(config) -> None:
     for name in (
         "max_turns",
         "max_tokens",
+        "python_timeout",
         "boltz_timeout",
+        "boltz_max_repeats_per_request",
         "boltz_worker_startup_timeout",
         "boltz_cpu_threads",
+        "admet_timeout",
+        "vina_timeout",
+        "diffdock_timeout",
         "task_timeout",
     ):
         if int(getattr(config, name)) < 1:
@@ -42,16 +47,21 @@ def validate_agent_config(config) -> None:
         value = getattr(config, name)
         if value is not None and int(value) < 1:
             raise RuntimeError(f"Agent setting {name} must be positive when configured")
+    for name in ("boltz_budget", "admet_budget", "vina_budget", "diffdock_budget"):
+        if int(getattr(config, name)) < 0:
+            raise RuntimeError(f"Agent setting {name} must be non-negative")
     if config.llm_timeout is not None and config.llm_timeout > config.task_timeout:
         raise RuntimeError(
             f"LLM timeout ({config.llm_timeout}s) exceeds the per-task timeout "
             f"({config.task_timeout}s)"
         )
-    if config.boltz_timeout > config.task_timeout:
-        raise RuntimeError(
-            f"Boltz timeout ({config.boltz_timeout}s) exceeds the per-task timeout "
-            f"({config.task_timeout}s)"
-        )
+    for name in ("boltz_timeout", "vina_timeout", "diffdock_timeout"):
+        value = int(getattr(config, name))
+        if value > config.task_timeout:
+            raise RuntimeError(
+                f"{name} ({value}s) exceeds the per-task timeout "
+                f"({config.task_timeout}s)"
+            )
 
 
 def _redact_secrets(message: str) -> str:

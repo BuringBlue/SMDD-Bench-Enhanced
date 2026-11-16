@@ -3,7 +3,7 @@
 # admet-ai is deliberately installed separately with --no-deps because its
 # pandas<2.2 declaration conflicts with both Boltz and the upstream pinned
 # pandas==2.3.3. This is the same workaround used by the upstream Dockerfiles.
-rdkit==2025.9.4
+rdkit==2026.3.4
 numpy==1.26.4
 pandas==2.3.3
 scikit-learn==1.6.1

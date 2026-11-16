@@ -1,15 +1,18 @@
 """Tool definitions and execution for the SMDD-Bench agent.
 
 Tools execute inside a Docker container via `docker exec`.
-Budget tracking for predict_boltz and predict_admet is managed host-side.
+Budget tracking for Boltz, ADMET, Vina, and DiffDock is managed host-side.
 """
 
 import json
+import hashlib
 import os
+import posixpath
 import subprocess
 import tempfile
 import time
 import uuid
+from pathlib import Path
 
 from agent_harness.config import AgentConfig
 
@@ -28,10 +31,16 @@ class ToolExecutor:
         self.workspace_dir = workspace_dir
         self.boltz_calls = 0
         self.admet_calls = 0
+        self.vina_calls = 0
+        self.diffdock_calls = 0
+        self._boltz_request_calls = {}
 
-    def _docker_exec(self, cmd, timeout=120):
+    def _docker_exec(self, cmd, timeout=120, workdir=None):
         """Run a command inside the container. Returns (stdout+stderr, returncode)."""
-        full_cmd = ["docker", "exec", "--workdir", self.workspace_dir, self.container_id] + cmd
+        full_cmd = [
+            "docker", "exec", "--workdir", workdir or self.workspace_dir,
+            self.container_id,
+        ] + cmd
         proc = subprocess.run(
             full_cmd,
             capture_output=True,
@@ -45,9 +54,12 @@ class ToolExecutor:
             output += proc.stderr
         return output, proc.returncode
 
-    def _docker_exec_shell(self, shell_cmd, timeout=120):
+    def _docker_exec_shell(self, shell_cmd, timeout=120, workdir=None):
         """Run a shell command inside the container. Returns (stdout+stderr, returncode)."""
-        full_cmd = ["docker", "exec", "--workdir", self.workspace_dir, self.container_id, "bash", "-c", shell_cmd]
+        full_cmd = [
+            "docker", "exec", "--workdir", workdir or self.workspace_dir,
+            self.container_id, "bash", "-c", shell_cmd,
+        ]
         proc = subprocess.run(
             full_cmd,
             capture_output=True,
@@ -85,31 +97,107 @@ class ToolExecutor:
             check=True,
         )
 
+    def _prepare_boltz_input(self, boltz_input, call_number):
+        """Backend hook for attaching precomputed MSAs."""
+        return boltz_input
+
+    def _use_msa_server(self):
+        return True
+
+    def _boltz_num_workers(self):
+        return 2
+
+    def _exec_boltz(self, command, timeout):
+        return self._docker_exec(command, timeout)
+
+    def _exec_vina(self, command, timeout):
+        """Backend hook for running the fixed Vina-GPU command with GPU access."""
+        return self._docker_exec(command, timeout)
+
+    def _exec_diffdock(self, command, timeout):
+        """Backend hook for running the fixed DiffDock command with GPU access."""
+        return self._docker_exec(command, timeout)
+
+    def _resolve_workspace_path(self, value, allowed_suffixes):
+        """Return a safe backend path and its workspace-relative form."""
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("workspace path must be a non-empty string")
+        value = value.strip()
+        workspace = self.workspace_dir.rstrip("/")
+        if value.startswith(workspace + "/"):
+            relative = value[len(workspace) + 1:]
+        elif value.startswith("/workspace/"):
+            # The prompt exposes /workspace for both Docker and local backends.
+            relative = value[len("/workspace/"):]
+        elif value.startswith("/"):
+            raise ValueError("path must be inside the workspace")
+        else:
+            relative = value
+        relative = posixpath.normpath(relative)
+        if relative in {"", ".", ".."} or relative.startswith("../"):
+            raise ValueError("path traversal outside the workspace is not allowed")
+        if allowed_suffixes and not relative.lower().endswith(tuple(allowed_suffixes)):
+            raise ValueError(f"path must end with one of: {', '.join(allowed_suffixes)}")
+        return f"{workspace}/{relative}", relative
+
+    def _read_json_from_container(self, container_path):
+        output, returncode = self._docker_exec(["cat", container_path], timeout=30)
+        if returncode != 0:
+            raise RuntimeError(f"Could not read tool result {container_path}: {output.strip()}")
+        return json.loads(output)
+
+    def _make_workspace_paths_relative(self, value):
+        """Avoid exposing backend-absolute paths in tool results."""
+        workspace_prefix = self.workspace_dir.rstrip("/") + "/"
+        if isinstance(value, dict):
+            return {key: self._make_workspace_paths_relative(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._make_workspace_paths_relative(item) for item in value]
+        if isinstance(value, str) and value.startswith(workspace_prefix):
+            return value[len(workspace_prefix):]
+        return value
+
     def dispatch(self, tool_name, arguments):
         """Dispatch a tool call. Returns (result_str, extra_log_data)."""
+        counters_before = (
+            self.boltz_calls,
+            self.admet_calls,
+            self.vina_calls,
+            self.diffdock_calls,
+        )
+        boltz_requests_before = self._boltz_request_calls.copy()
         try:
             if tool_name == "python":
                 return self.run_python(arguments)
+            elif tool_name == "validate_molecule":
+                return self.run_validate_molecule(arguments)
             elif tool_name == "predict_boltz":
                 return self.run_predict_boltz(arguments)
             elif tool_name == "predict_admet":
                 return self.run_predict_admet(arguments)
+            elif tool_name == "dock_vina":
+                return self.run_dock_vina(arguments)
+            elif tool_name == "dock_diffdock":
+                return self.run_dock_diffdock(arguments)
             elif tool_name == "submit":
                 return self.run_submit(arguments)
             else:
                 return f"Unknown tool: {tool_name}", {}
         except Exception as e:
-            # Roll back budget if the call was counted but never actually ran
-            if tool_name == "predict_boltz" and self.boltz_calls > 0:
-                self.boltz_calls -= 1
-            elif tool_name == "predict_admet" and self.admet_calls > 0:
-                self.admet_calls -= 1
+            # Roll back budget and repeat tracking if the call never completed.
+            (self.boltz_calls, self.admet_calls,
+             self.vina_calls, self.diffdock_calls) = counters_before
+            self._boltz_request_calls = boltz_requests_before
 
             budget_msg = ""
             if tool_name == "predict_boltz":
                 budget_msg = f" You have {self.config.boltz_budget - self.boltz_calls} Boltz calls remaining."
             elif tool_name == "predict_admet":
                 budget_msg = f" You have {self.config.admet_budget - self.admet_calls} ADMET calls remaining."
+            elif tool_name == "dock_vina":
+                budget_msg = f" You have {self.config.vina_budget - self.vina_calls} Vina calls remaining."
+            elif tool_name == "dock_diffdock":
+                budget_msg = f" You have {self.config.diffdock_budget - self.diffdock_calls} DiffDock calls remaining."
 
             return f"ERROR: Tool '{tool_name}' failed: {type(e).__name__}: {e}.{budget_msg}", {}
 
@@ -131,7 +219,7 @@ class ToolExecutor:
                 timeout=self.config.python_timeout,
             )
             # Clean up script in container
-            self._docker_exec_shell(f"rm -f {container_script_path}", timeout=10)
+            self._docker_exec(["rm", "-f", container_script_path], timeout=10)
         except subprocess.TimeoutExpired:
             output = f"ERROR: Python execution timed out after {self.config.python_timeout} seconds."
             returncode = -1
@@ -139,6 +227,80 @@ class ToolExecutor:
             os.unlink(tmp_path)
 
         return self._truncate(output), {}
+
+    def run_validate_molecule(self, arguments):
+        """Run the fixed RDKit validation pipeline inside the task sandbox."""
+        smiles = str(arguments.get("smiles", "")).strip()
+        if not smiles:
+            return "ERROR: validate_molecule requires a non-empty SMILES string.", {}
+
+        source = Path(__file__).resolve().parent.parent / "smdd_runtime" / "validate_molecule.py"
+        script_name = f".tmp_validate_{uuid.uuid4().hex[:8]}.py"
+        container_script = f"{self.workspace_dir}/{script_name}"
+        try:
+            self._copy_to_container(str(source), container_script)
+            output, returncode = self._docker_exec(
+                [
+                    "python",
+                    container_script,
+                    "--smiles",
+                    smiles,
+                    "--reference",
+                    "reference.sdf",
+                ],
+                timeout=self.config.python_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return (
+                f"ERROR: Molecule validation timed out after {self.config.python_timeout} seconds.",
+                {},
+            )
+        finally:
+            try:
+                self._docker_exec(["rm", "-f", container_script], timeout=10)
+            except Exception:
+                pass
+
+        if returncode != 0:
+            return f"ERROR: Molecule validation failed (exit code {returncode}).\n{self._truncate(output)}", {}
+        return self._truncate(output), {}
+
+    @staticmethod
+    def _canonical_smiles(smiles):
+        value = str(smiles or "").strip()
+        try:
+            from rdkit import Chem
+
+            mol = Chem.MolFromSmiles(value)
+            if mol is not None:
+                return Chem.MolToSmiles(mol)
+        except Exception:
+            pass
+        return value
+
+    def _boltz_request_signature(self, arguments):
+        proteins = [
+            {
+                "id": str(item.get("id", "")),
+                "sequence": "".join(str(item.get("sequence", "")).split()).upper(),
+            }
+            for item in arguments.get("protein_sequences", [])
+        ]
+        co_ligands = [
+            {
+                "id": str(item.get("id", "")),
+                "smiles": self._canonical_smiles(item.get("smiles", "")),
+            }
+            for item in arguments.get("co_ligand_smiles") or []
+        ]
+        payload = {
+            "smiles": self._canonical_smiles(arguments.get("smiles", "")),
+            "protein_sequences": proteins,
+            "pocket_residues": arguments.get("pocket_residues") or [],
+            "co_ligand_smiles": co_ligands,
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
     def run_predict_boltz(self, arguments):
         """Run Boltz structure prediction inside the container."""
@@ -149,7 +311,24 @@ class ToolExecutor:
                 {"budget_exceeded": True},
             )
 
+        request_signature = self._boltz_request_signature(arguments)
+        request_calls = self._boltz_request_calls.get(request_signature, 0)
+        repeat_limit = self.config.boltz_max_repeats_per_request
+        if request_calls >= repeat_limit:
+            return (
+                "ERROR: Repeated Boltz request limit reached. "
+                f"This ligand/target request has already run {request_calls} times "
+                f"(limit: {repeat_limit}). Use the existing predictions, test a "
+                "different molecule/target request, or submit the best validated candidate.",
+                {
+                    "repeat_limit_exceeded": True,
+                    "request_calls": request_calls,
+                    "budget_remaining": self.config.boltz_budget - self.boltz_calls,
+                },
+            )
+
         self.boltz_calls += 1
+        self._boltz_request_calls[request_signature] = request_calls + 1
         call_number = self.boltz_calls
 
         smiles = arguments["smiles"]
@@ -180,6 +359,7 @@ class ToolExecutor:
                 }
             }]
         boltz_input["properties"] = [{"affinity": {"binder": "LIG"}}]
+        boltz_input = self._prepare_boltz_input(boltz_input, call_number)
 
         # Write YAML to temp file, copy to container
         job_name = f"boltz_call_{call_number}"
@@ -193,18 +373,21 @@ class ToolExecutor:
         os.unlink(tmp_yaml)
 
         # Run Boltz inside container
-        boltz_cmd = (
-            f"/opt/oracle/bin/boltz predict {container_yaml} "
-            f"--out_dir {container_out_dir} "
-            f"--use_msa_server --use_potentials "
-            f"--diffusion_samples {num_samples} "
-            f"--seed {self.config.seed} "
-            f"--diffusion_samples_affinity {num_samples} "
-            f"--max_parallel_samples 2"
-        )
+        boltz_cmd = [
+            "/opt/oracle/bin/boltz", "predict", container_yaml,
+            "--out_dir", container_out_dir,
+            "--use_potentials",
+            "--diffusion_samples", str(num_samples),
+            "--seed", str(self.config.seed),
+            "--diffusion_samples_affinity", str(num_samples),
+            "--max_parallel_samples", "2",
+            "--num_workers", str(self._boltz_num_workers()),
+        ]
+        if self._use_msa_server():
+            boltz_cmd.append("--use_msa_server")
 
         try:
-            output, returncode = self._docker_exec_shell(
+            output, returncode = self._exec_boltz(
                 boltz_cmd,
                 timeout=self.config.boltz_timeout,
             )
@@ -249,7 +432,7 @@ else:
             ["python", container_script],
             timeout=30,
         )
-        self._docker_exec_shell(f"rm -f {container_script}", timeout=10)
+        self._docker_exec(["rm", "-f", container_script], timeout=10)
 
         # Parse affinity results
         try:
@@ -292,6 +475,7 @@ else:
 
         smiles = arguments["smiles"]
 
+        smiles_literal = json.dumps(smiles)
         admet_script = f"""
 import json
 import functools
@@ -302,7 +486,7 @@ torch.load = functools.partial(torch.load, weights_only=False)
 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
     from admet_ai import ADMETModel
     model = ADMETModel()
-    preds = model.predict(smiles="{smiles}")
+    preds = model.predict(smiles={smiles_literal})
 import sys
 sys.stdout = sys.__stdout__
 sys.stderr = sys.__stderr__
@@ -358,24 +542,117 @@ print(json.dumps(result))
                 "budget_remaining": self.config.admet_budget - self.admet_calls,
             }
 
+    def run_dock_vina(self, arguments):
+        """Run isolated Vina-GPU 2.1 with Meeko preparation."""
+        if self.vina_calls >= self.config.vina_budget:
+            return (
+                f"ERROR: Vina budget exceeded ({self.config.vina_budget} calls).",
+                {"budget_exceeded": True},
+            )
+
+        receptor_path, _ = self._resolve_workspace_path(
+            arguments.get("receptor_path"), (".pdb", ".pdbqt")
+        )
+        center = arguments.get("center")
+        box_size = arguments.get("box_size", [20.0, 20.0, 20.0])
+        if not isinstance(center, list) or len(center) != 3:
+            raise ValueError("center must be [x, y, z]")
+        if not isinstance(box_size, list) or len(box_size) != 3:
+            raise ValueError("box_size must be [x, y, z]")
+
+        self.vina_calls += 1
+        call_number = self.vina_calls
+        output_dir = f"{self.workspace_dir}/vina_results/call_{call_number}"
+        command = [
+            "/opt/vina/bin/python", "/opt/smdd-tools/vina_dock.py",
+            "--receptor", receptor_path,
+            "--smiles", arguments["smiles"],
+            "--output-dir", output_dir,
+            "--center", *[str(value) for value in center],
+            "--box-size", *[str(value) for value in box_size],
+            "--search-depth", str(arguments.get("search_depth", 8)),
+            "--num-poses", str(arguments.get("num_poses", 9)),
+            "--seed", str(self.config.seed),
+        ]
+        try:
+            output, returncode = self._exec_vina(
+                command, timeout=self.config.vina_timeout
+            )
+        except subprocess.TimeoutExpired:
+            return (
+                f"ERROR: Vina docking timed out after {self.config.vina_timeout} seconds.",
+                {"call_number": call_number,
+                 "budget_remaining": self.config.vina_budget - self.vina_calls},
+            )
+        metadata = {
+            "call_number": call_number,
+            "budget_remaining": self.config.vina_budget - self.vina_calls,
+        }
+        if returncode != 0:
+            return f"ERROR: Vina exited with code {returncode}.\n{self._truncate(output)}", metadata
+        result = self._read_json_from_container(f"{output_dir}/result.json")
+        result = self._make_workspace_paths_relative(result)
+        result["budget_remaining"] = metadata["budget_remaining"]
+        return json.dumps(result, indent=4), metadata
+
+    def run_dock_diffdock(self, arguments):
+        """Run isolated DiffDock-L v1.1.3 inference."""
+        if self.diffdock_calls >= self.config.diffdock_budget:
+            return (
+                f"ERROR: DiffDock budget exceeded ({self.config.diffdock_budget} calls).",
+                {"budget_exceeded": True},
+            )
+
+        receptor_path, _ = self._resolve_workspace_path(
+            arguments.get("receptor_path"), (".pdb",)
+        )
+        self.diffdock_calls += 1
+        call_number = self.diffdock_calls
+        output_dir = f"{self.workspace_dir}/diffdock_results/call_{call_number}"
+        command = [
+            "/opt/diffdock/bin/python", "/opt/smdd-tools/diffdock_dock.py",
+            "--receptor", receptor_path,
+            "--smiles", arguments["smiles"],
+            "--output-dir", output_dir,
+            "--samples", str(arguments.get("num_samples", 10)),
+            "--inference-steps", str(arguments.get("inference_steps", 20)),
+        ]
+        try:
+            output, returncode = self._exec_diffdock(
+                command, timeout=self.config.diffdock_timeout
+            )
+        except subprocess.TimeoutExpired:
+            return (
+                f"ERROR: DiffDock timed out after {self.config.diffdock_timeout} seconds.",
+                {"call_number": call_number,
+                 "budget_remaining": self.config.diffdock_budget - self.diffdock_calls},
+            )
+        metadata = {
+            "call_number": call_number,
+            "budget_remaining": self.config.diffdock_budget - self.diffdock_calls,
+        }
+        if returncode != 0:
+            return f"ERROR: DiffDock exited with code {returncode}.\n{self._truncate(output)}", metadata
+        result = self._read_json_from_container(f"{output_dir}/result.json")
+        result = self._make_workspace_paths_relative(result)
+        result["budget_remaining"] = metadata["budget_remaining"]
+        return json.dumps(result, indent=4), metadata
+
     def run_submit(self, arguments):
         """Validate and register the agent's submission."""
-        file_path = arguments.get("file_path", "")
-        # Normalize: remove leading slash or /workspace/ prefix
+        file_path = str(arguments.get("file_path", "")).strip()
         if file_path.startswith("/workspace/"):
             file_path = file_path[len("/workspace/"):]
-        elif file_path.startswith("/"):
-            file_path = file_path[1:]
+        if not file_path or file_path.startswith("/"):
+            return "ERROR: Submission path must be relative to the workspace.", {}
+        file_path = posixpath.normpath(file_path)
+        if file_path == ".." or file_path.startswith("../"):
+            return "ERROR: Submission path must stay inside the workspace.", {}
 
         container_path = f"{self.workspace_dir}/{file_path}"
 
-        # Check file exists
-        output, returncode = self._docker_exec_shell(
-            f'test -f "{container_path}" && echo "EXISTS" || echo "NOT_FOUND"',
-            timeout=10,
-        )
-
-        if "NOT_FOUND" in output:
+        _, returncode = self._docker_exec(["test", "-f", container_path], timeout=10)
+        if returncode != 0:
             return f"ERROR: File not found at {container_path}. Please create the file first, then call submit again.", {}
 
-        return f"Submission accepted: {file_path}", {}
+        return f"Submission accepted: {file_path}", {"submitted_file": file_path}

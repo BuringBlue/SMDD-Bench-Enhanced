@@ -4,10 +4,11 @@ channels:
   - conda-forge
 
 dependencies:
-  # Python 3.10 and these non-PyPI chemistry tools match the upstream
+  # Python and these non-PyPI chemistry tools match the upgraded
   # agent/evaluator Dockerfiles. Python packages are installed from the
   # repository's compatibility-pinned requirements-conda.txt separately.
-  - python=3.10
+  - python=3.11
   - pip
-  - openbabel=3.1.1
+  - rdkit=2026.03.4
+  - openbabel=3.2.1
   - plip=3.0.0

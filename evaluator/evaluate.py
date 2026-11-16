@@ -20,12 +20,24 @@ import sys
 import time
 from datetime import datetime, timezone
 
+from smdd_runtime.run_state import agent_run_is_complete
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("smdd_evaluator")
+
+TERMINAL_TASK_STATUSES = {"passed", "failed"}
+AGENT_SUBMITTED_STATUS = "submitted"
+AGENT_NOT_SUBMITTED_REASON = "agent_not_submitted"
+AGENT_TERMINAL_FAILURE_STATUSES = {
+    "max_turns_exceeded",
+    "token_budget_exceeded",
+    "no_tool_limit_exceeded",
+    "error",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -66,14 +78,13 @@ def resolve_tasks(args):
     if args.all_in_folder:
         agent_outputs = os.path.abspath(args.agent_outputs)
         task_ids = []
+        if not os.path.isdir(agent_outputs):
+            return task_ids
         for name in sorted(os.listdir(agent_outputs)):
             if os.path.isdir(os.path.join(agent_outputs, name)):
                 task_path = os.path.join(tasks_dir, name, "task.yaml")
                 if os.path.isfile(task_path):
                     task_ids.append(name)
-        if not task_ids:
-            print(f"No evaluable tasks found in {agent_outputs}", file=sys.stderr)
-            sys.exit(1)
         return task_ids
 
     if args.tasks:
@@ -117,6 +128,129 @@ def resolve_tasks(args):
     sys.exit(1)
 
 
+def _agent_status(agent_outputs, task_id):
+    """Return the validated agent status used to gate metric execution."""
+    result_path = os.path.join(agent_outputs, task_id, "agent_result.json")
+    try:
+        with open(result_path, "r", encoding="utf-8") as handle:
+            result = json.load(handle)
+    except FileNotFoundError:
+        return "missing_agent_result"
+    except (OSError, ValueError, TypeError):
+        return "invalid_agent_result"
+
+    if not isinstance(result, dict) or result.get("task_id") != task_id:
+        return "invalid_agent_result"
+    status = result.get("status")
+    return status if isinstance(status, str) and status else "invalid_agent_status"
+
+
+def _write_not_submitted_result(run_results_dir, task_id, agent_status):
+    """Record a zero-score result without running any evaluation metric."""
+    result_dir = os.path.join(run_results_dir, task_id)
+    os.makedirs(result_dir, exist_ok=True)
+    result = {
+        "task_id": task_id,
+        "status": "failed",
+        "reason_code": AGENT_NOT_SUBMITTED_REASON,
+        "agent_status": agent_status,
+        "metrics_executed": False,
+        "steps": [
+            {
+                "name": "Agent submission",
+                "status": "failed",
+                "result": agent_status,
+                "condition": {"eq": AGENT_SUBMITTED_STATUS},
+                "duration_s": 0.0,
+                "reason": (
+                    f"Agent status is {agent_status!r}; metrics were not executed."
+                ),
+            }
+        ],
+    }
+    result_path = os.path.join(result_dir, "result.json")
+    temp_path = result_path + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(result, handle, indent=4)
+    os.replace(temp_path, result_path)
+
+
+def _remove_synthetic_not_submitted_result(run_results_dir, task_id):
+    """Remove an obsolete synthetic failure while an Agent task is in flight."""
+    result_path = os.path.join(run_results_dir, task_id, "result.json")
+    try:
+        with open(result_path, "r", encoding="utf-8") as handle:
+            result = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return
+    if result.get("reason_code") == AGENT_NOT_SUBMITTED_REASON:
+        try:
+            os.unlink(result_path)
+        except FileNotFoundError:
+            pass
+
+
+def filter_existing_agent_tasks(task_ids, agent_outputs):
+    """Limit every selection mode to task folders already created by Agent."""
+    return [
+        task_id
+        for task_id in task_ids
+        if os.path.isdir(os.path.join(agent_outputs, task_id))
+    ]
+
+
+def prepare_evaluation_tasks(task_ids, agent_outputs, run_results_dir):
+    """Partition submitted, terminal-failure, and still-running Agent tasks."""
+    submitted = []
+    not_submitted = {}
+    incomplete = {}
+    for task_id in task_ids:
+        status = _agent_status(agent_outputs, task_id)
+        if status == AGENT_SUBMITTED_STATUS:
+            submitted.append(task_id)
+        elif status in AGENT_TERMINAL_FAILURE_STATUSES:
+            not_submitted[task_id] = status
+            _write_not_submitted_result(
+                run_results_dir, task_id, status
+            )
+        else:
+            incomplete[task_id] = status
+            _remove_synthetic_not_submitted_result(run_results_dir, task_id)
+    return submitted, not_submitted, incomplete
+
+
+def task_is_complete(run_results_dir, task_id):
+    """Return true only for a valid, non-error terminal evaluation result."""
+    result_path = os.path.join(run_results_dir, task_id, "result.json")
+    try:
+        with open(result_path, "r", encoding="utf-8") as handle:
+            result = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return False
+    if not isinstance(result, dict) or result.get("task_id") != task_id:
+        return False
+    # A later agent resume may change this task to submitted.  Its synthetic
+    # zero-score result must never suppress the first real metric evaluation.
+    if result.get("reason_code") == AGENT_NOT_SUBMITTED_REASON:
+        return False
+    if result.get("status") not in TERMINAL_TASK_STATUSES:
+        return False
+    steps = result.get("steps")
+    if not isinstance(steps, list) or not steps or not all(
+        isinstance(step, dict)
+        and isinstance(step.get("name"), str)
+        and step.get("status") in {"passed", "failed", "errored", "skipped"}
+        for step in steps
+    ):
+        return False
+    step_statuses = {step["status"] for step in steps}
+    if "errored" in step_statuses:
+        return False
+    if result["status"] == "passed":
+        return step_statuses == {"passed"}
+    return "failed" in step_statuses
+
+
 # ---------------------------------------------------------------------------
 # Docker execution
 # ---------------------------------------------------------------------------
@@ -132,6 +266,18 @@ def run_task_in_docker(task_id, tasks_dir, agent_outputs, run_results_dir, docke
     cmd = ["docker", "run", "--rm", "--shm-size=32g"]
     if gpu_id is not None:
         cmd += ["--gpus", f'device={gpu_id}']
+    drugbank_host = os.environ.get("SMDD_DRUGBANK_STRUCTURES")
+    if drugbank_host:
+        drugbank_host = os.path.abspath(drugbank_host)
+        if not os.path.isfile(drugbank_host):
+            raise FileNotFoundError(
+                f"SMDD_DRUGBANK_STRUCTURES does not exist: {drugbank_host}"
+            )
+        drugbank_container = f"/eval/novelty/{os.path.basename(drugbank_host)}"
+        cmd += [
+            "-v", f"{drugbank_host}:{drugbank_container}:ro",
+            "-e", f"SMDD_DRUGBANK_STRUCTURES={drugbank_container}",
+        ]
     cmd += [
         "-v", f"{task_host}:/eval/task:ro",
         "-v", f"{output_host}:/eval/output:ro",
@@ -182,16 +328,21 @@ def run_task_in_docker(task_id, tasks_dir, agent_outputs, run_results_dir, docke
 # Summary builder
 # ---------------------------------------------------------------------------
 
-def build_summary(run_name, results_dir):
+def build_summary(run_name, results_dir, *, is_final=True, task_ids=None):
     """Scan all result.json files in results_dir/run_name and write summary.json."""
     tasks = {}
+    not_submitted_tasks = set()
+    step_failure_counts = {}
     by_type = {}
+    included_task_ids = set(task_ids) if task_ids is not None else None
 
     run_results_dir = os.path.join(results_dir, run_name)
     if not os.path.isdir(run_results_dir):
         return None
 
     for task_dir_name in sorted(os.listdir(run_results_dir)):
+        if included_task_ids is not None and task_dir_name not in included_task_ids:
+            continue
         result_path = os.path.join(run_results_dir, task_dir_name, "result.json")
         if not os.path.isfile(result_path):
             continue
@@ -202,6 +353,17 @@ def build_summary(run_name, results_dir):
         task_id = result.get("task_id", task_dir_name)
         status = result.get("status", "errored")
         tasks[task_id] = status
+        if result.get("reason_code") == AGENT_NOT_SUBMITTED_REASON:
+            not_submitted_tasks.add(task_id)
+        elif result.get("metrics_executed", True):
+            for step in result.get("steps", []):
+                if not isinstance(step, dict) or step.get("status") != "failed":
+                    continue
+                step_name = step.get("name")
+                if isinstance(step_name, str):
+                    step_failure_counts[step_name] = (
+                        step_failure_counts.get(step_name, 0) + 1
+                    )
 
         parts = task_id.split("_")
         if len(parts) >= 2:
@@ -213,10 +375,18 @@ def build_summary(run_name, results_dir):
             type_num = "unknown"
 
         if type_num not in by_type:
-            by_type[type_num] = {"passed": 0, "failed": 0, "errored": 0, "total": 0}
+            by_type[type_num] = {
+                "passed": 0,
+                "failed": 0,
+                "errored": 0,
+                "not_submitted": 0,
+                "total": 0,
+            }
         by_type[type_num]["total"] += 1
         if status in ("passed", "failed", "errored"):
             by_type[type_num][status] += 1
+        if task_id in not_submitted_tasks:
+            by_type[type_num]["not_submitted"] += 1
 
     summary = {
         "run_name": run_name,
@@ -225,6 +395,15 @@ def build_summary(run_name, results_dir):
         "tasks_passed": sum(1 for s in tasks.values() if s == "passed"),
         "tasks_failed": sum(1 for s in tasks.values() if s == "failed"),
         "tasks_errored": sum(1 for s in tasks.values() if s == "errored"),
+        "tasks_not_submitted": len(not_submitted_tasks),
+        "tasks_metrics_executed": len(tasks) - len(not_submitted_tasks),
+        "step_failure_counts": step_failure_counts,
+        "status": "complete" if is_final else "in_progress",
+        "is_final": bool(is_final),
+        "final_score": (
+            (sum(1 for s in tasks.values() if s == "passed") / len(tasks))
+            if is_final and tasks else (0.0 if is_final else None)
+        ),
         "by_type": by_type,
         "tasks": tasks,
     }
@@ -297,8 +476,11 @@ def main():
 
     multiprocessing.set_start_method("spawn", force=True)
 
-    task_ids = resolve_tasks(args)
-    logger.info(f"Tasks to evaluate: {len(task_ids)}")
+    selected_task_ids = filter_existing_agent_tasks(
+        resolve_tasks(args),
+        os.path.abspath(args.agent_outputs),
+    )
+    logger.info(f"Agent task folders selected: {len(selected_task_ids)}")
 
     if args.gpus is not None:
         gpu_ids = [int(g.strip()) for g in args.gpus.split(",")]
@@ -308,6 +490,17 @@ def main():
     results_base = "results"
     results_dir_run = os.path.join(results_base, args.run_name)
     os.makedirs(results_dir_run, exist_ok=True)
+    task_ids, not_submitted, incomplete = prepare_evaluation_tasks(
+        selected_task_ids,
+        os.path.abspath(args.agent_outputs),
+        results_dir_run,
+    )
+    logger.info(
+        "Agent submitted=%d, terminal non-submitted=%d, incomplete=%d; only submitted tasks run metrics",
+        len(task_ids),
+        len(not_submitted),
+        len(incomplete),
+    )
 
     n_done = 0
     n_error = 0
@@ -366,7 +559,12 @@ def main():
                 pool.join()
                 raise
 
-    summary = build_summary(args.run_name, results_base)
+    summary = build_summary(
+        args.run_name,
+        results_base,
+        is_final=agent_run_is_complete(os.path.abspath(args.agent_outputs)),
+        task_ids=selected_task_ids,
+    )
 
     if summary:
         print(f"\n{'='*60}")
@@ -374,6 +572,9 @@ def main():
         print(f"Passed: {summary['tasks_passed']}/{summary['tasks_evaluated']}")
         print(f"Failed: {summary['tasks_failed']}/{summary['tasks_evaluated']}")
         print(f"Errored: {summary['tasks_errored']}/{summary['tasks_evaluated']}")
+        print(f"Not submitted: {summary['tasks_not_submitted']}/{summary['tasks_evaluated']}")
+        print(f"Metrics executed: {summary['tasks_metrics_executed']}/{summary['tasks_evaluated']}")
+        print(f"Final score: {summary['final_score'] if summary['is_final'] else 'pending (Agent still running)'}")
         print(f"Worker errors: {n_error}")
         print(f"\nBy type:")
         for type_num, counts in sorted(summary['by_type'].items()):
